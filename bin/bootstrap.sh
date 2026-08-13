@@ -147,16 +147,21 @@ SITE_READY="${SITES}/${SITE_NAME}/.railway-site-ready"
 if [ ! -f "${SITE_READY}" ]; then
   : "${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required to create the site}"
 
-  TABLE_COUNT="$(MYSQL_PWD="${DB_ROOT_PASSWORD}" mariadb -h "${DB_HOST}" -P "${DB_PORT}" \
+  # "Does this database hold a *finished* install?" — not "does it hold tables".
+  # An interrupted `bench new-site` leaves most of the framework schema behind
+  # but no patch log, and reattaching to that lands on a migrate that dies on a
+  # missing Patch Log table. A completed install has well over a thousand rows.
+  PATCH_ROWS="$(MYSQL_PWD="${DB_ROOT_PASSWORD}" mariadb -h "${DB_HOST}" -P "${DB_PORT}" \
     -u "${DB_ROOT_USER}" -N -B -e \
-    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${SITE_DB_NAME}'" \
+    "SELECT COUNT(*) FROM \`${SITE_DB_NAME}\`.\`tabPatch Log\`" \
     2>/dev/null || echo 0)"
+  PATCH_ROWS="${PATCH_ROWS:-0}"
 
-  if [ "${TABLE_COUNT:-0}" -gt 0 ]; then
+  if [ "${PATCH_ROWS}" -gt 0 ]; then
     # The database already holds a site — the volume is new, not the install.
     # Everything site_config.json needs is derived from FRAPPE_SECRET, so
     # reattach rather than dropping a live schema.
-    log "database ${SITE_DB_NAME} holds ${TABLE_COUNT} tables; reattaching to it"
+    log "database ${SITE_DB_NAME} holds a completed install (${PATCH_ROWS} patches); reattaching"
     mkdir -p "${SITES}/${SITE_NAME}/public/files" \
       "${SITES}/${SITE_NAME}/private/files" \
       "${SITES}/${SITE_NAME}/private/backups" \
