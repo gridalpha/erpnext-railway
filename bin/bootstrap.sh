@@ -139,38 +139,66 @@ APP_VERSIONS="$(grep -h '^__version__' apps/*/*/__init__.py 2>/dev/null | tr -d 
 VERSION_MARKER="${SITES}/.railway-app-versions"
 
 # --- first boot: create the site --------------------------------------------
-# The marker is written only after a bootstrap that finished. site_config.json
-# is not a safe substitute: `bench new-site` writes it before it touches the
-# database, so an interrupted first boot leaves a site directory pointing at an
-# empty schema, which later boots then try to migrate.
+# The database, not the volume, decides whether a site exists. A file on the
+# volume cannot be trusted for this: `bench new-site` writes site_config.json
+# before it touches the database, so an interrupted first boot leaves a site
+# directory pointing at a half-built schema that every later boot then tries to
+# migrate. The patch log is the honest signal — a finished install has well over
+# a thousand rows, an abandoned one has no such table at all.
 SITE_READY="${SITES}/${SITE_NAME}/.railway-site-ready"
-if [ ! -f "${SITE_READY}" ]; then
-  : "${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required to create the site}"
 
-  # "Does this database hold a *finished* install?" — not "does it hold tables".
-  # An interrupted `bench new-site` leaves most of the framework schema behind
-  # but no patch log, and reattaching to that lands on a migrate that dies on a
-  # missing Patch Log table. A completed install has well over a thousand rows.
-  PATCH_ROWS="$(MYSQL_PWD="${DB_ROOT_PASSWORD}" mariadb -h "${DB_HOST}" -P "${DB_PORT}" \
-    -u "${DB_ROOT_USER}" -N -B -e \
-    "SELECT COUNT(*) FROM \`${SITE_DB_NAME}\`.\`tabPatch Log\`" \
-    2>/dev/null || echo 0)"
-  PATCH_ROWS="${PATCH_ROWS:-0}"
+db_query() {
+  MYSQL_PWD="${DB_ROOT_PASSWORD}" mariadb -h "${DB_HOST}" -P "${DB_PORT}" \
+    -u "${DB_ROOT_USER}" -N -B -e "$1"
+}
 
-  if [ "${PATCH_ROWS}" -gt 0 ]; then
-    # The database already holds a site — the volume is new, not the install.
-    # Everything site_config.json needs is derived from FRAPPE_SECRET, so
-    # reattach rather than dropping a live schema.
-    log "database ${SITE_DB_NAME} holds a completed install (${PATCH_ROWS} patches); reattaching"
-    mkdir -p "${SITES}/${SITE_NAME}/public/files" \
-      "${SITES}/${SITE_NAME}/private/files" \
-      "${SITES}/${SITE_NAME}/private/backups" \
-      "${SITES}/${SITE_NAME}/locks" \
-      "${SITES}/${SITE_NAME}/logs"
-    if [ ! -f "${SITES}/${SITE_NAME}/site_config.json" ]; then
-      SITE_CONFIG_PATH="${SITES}/${SITE_NAME}/site_config.json" \
-      SITE_DB_NAME="${SITE_DB_NAME}" SITE_DB_PASSWORD="${SITE_DB_PASSWORD}" \
-      python3 - <<'PY'
+: "${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required}"
+# Prove the connection separately, so that a database that is merely unreachable
+# can never be mistaken for a database with no site in it.
+if ! db_query 'SELECT 1' >/dev/null 2>&1; then
+  echo "[railway] cannot reach ${DB_HOST}:${DB_PORT} as ${DB_ROOT_USER}; refusing to continue" >&2
+  exit 1
+fi
+PATCH_ROWS="$(db_query "SELECT COUNT(*) FROM \`${SITE_DB_NAME}\`.\`tabPatch Log\`" 2>/dev/null || echo 0)"
+PATCH_ROWS="${PATCH_ROWS:-0}"
+
+if [ "${PATCH_ROWS}" -eq 0 ]; then
+  : "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required to create the site}"
+  log "no installed site in ${SITE_DB_NAME}; creating ${SITE_NAME} (several minutes)"
+  # --force drops whatever an interrupted boot left behind. Reached only when
+  # the database holds no finished install, so there is nothing to lose.
+  rm -rf "${SITES:?}/${SITE_NAME:?}"
+  bench new-site "${SITE_NAME}" \
+    --force \
+    --db-name "${SITE_DB_NAME}" \
+    --db-password "${SITE_DB_PASSWORD}" \
+    --db-root-username "${DB_ROOT_USER}" \
+    --db-root-password "${DB_ROOT_PASSWORD}" \
+    --admin-password "${ADMIN_PASSWORD}" \
+    --mariadb-user-host-login-scope='%' \
+    --install-app erpnext \
+    --set-default \
+    --verbose
+  # new-site derives the scheduler state from a site that did not exist yet and
+  # lands on "disabled"; without this, nothing scheduled ever runs.
+  bench --site "${SITE_NAME}" enable-scheduler
+  printf '%s' "${APP_VERSIONS}" > "${VERSION_MARKER}"
+  touch "${SITE_READY}"
+  log "site ${SITE_NAME} created"
+elif [ ! -f "${SITE_READY}" ]; then
+  # The database holds a site but this volume does not know about it — a
+  # replaced volume, or a restore. Everything site_config.json needs is derived
+  # from FRAPPE_SECRET, so rebuild it rather than dropping a live schema.
+  log "database ${SITE_DB_NAME} holds a completed install (${PATCH_ROWS} patches); reattaching"
+  mkdir -p "${SITES}/${SITE_NAME}/public/files" \
+    "${SITES}/${SITE_NAME}/private/files" \
+    "${SITES}/${SITE_NAME}/private/backups" \
+    "${SITES}/${SITE_NAME}/locks" \
+    "${SITES}/${SITE_NAME}/logs"
+  if [ ! -f "${SITES}/${SITE_NAME}/site_config.json" ]; then
+    SITE_CONFIG_PATH="${SITES}/${SITE_NAME}/site_config.json" \
+    SITE_DB_NAME="${SITE_DB_NAME}" SITE_DB_PASSWORD="${SITE_DB_PASSWORD}" \
+    python3 - <<'PY'
 import json, os
 json.dump(
     {
@@ -184,35 +212,12 @@ json.dump(
     sort_keys=True,
 )
 PY
-    fi
-    # Force the migrate below: the reattached schema may predate this image.
-    rm -f "${VERSION_MARKER}"
-  else
-    : "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required to create the site}"
-    log "creating site ${SITE_NAME} (this takes several minutes on first boot)"
-    # --force covers the database and site directory a previous interrupted
-    # boot may have left behind. Reached only when the schema is empty.
-    rm -rf "${SITES:?}/${SITE_NAME:?}"
-    bench new-site "${SITE_NAME}" \
-      --force \
-      --db-name "${SITE_DB_NAME}" \
-      --db-password "${SITE_DB_PASSWORD}" \
-      --db-root-username "${DB_ROOT_USER}" \
-      --db-root-password "${DB_ROOT_PASSWORD}" \
-      --admin-password "${ADMIN_PASSWORD}" \
-      --mariadb-user-host-login-scope='%' \
-      --install-app erpnext \
-      --set-default \
-      --verbose
-    # new-site derives the scheduler state from a site that did not exist yet
-    # and lands on "disabled"; without this, nothing scheduled ever runs.
-    bench --site "${SITE_NAME}" enable-scheduler
-    printf '%s' "${APP_VERSIONS}" > "${VERSION_MARKER}"
-    log "site ${SITE_NAME} created"
   fi
-  touch "${SITE_READY}"
+  # Force the migrate below: the reattached schema may predate this image. The
+  # ready marker is written only once that migrate has succeeded.
+  rm -f "${VERSION_MARKER}"
 else
-  log "site ${SITE_NAME} already exists"
+  log "site ${SITE_NAME} already exists (${PATCH_ROWS} patches applied)"
 fi
 
 echo "${SITE_NAME}" > "${SITES}/currentsite.txt"
@@ -225,6 +230,7 @@ if [ "${APP_VERSIONS}" != "$(cat "${VERSION_MARKER}" 2>/dev/null || true)" ]; th
   log "app versions changed, migrating"
   bench --site "${SITE_NAME}" migrate
   printf '%s' "${APP_VERSIONS}" > "${VERSION_MARKER}"
+  touch "${SITE_READY}"
   log "migration complete"
 fi
 
