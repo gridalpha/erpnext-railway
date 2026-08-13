@@ -220,7 +220,7 @@ else
   log "site ${SITE_NAME} already exists (${PATCH_ROWS} patches applied)"
 fi
 
-echo "${SITE_NAME}" > "${SITES}/currentsite.txt"
+# default_site is set by --set-default; currentsite.txt is deprecated in v16.
 
 # --- migrate after an image upgrade -----------------------------------------
 # The service tracks the v16 line, so a redeploy can land a newer frappe/erpnext
