@@ -139,25 +139,73 @@ APP_VERSIONS="$(grep -h '^__version__' apps/*/*/__init__.py 2>/dev/null | tr -d 
 VERSION_MARKER="${SITES}/.railway-app-versions"
 
 # --- first boot: create the site --------------------------------------------
-if [ ! -f "${SITES}/${SITE_NAME}/site_config.json" ]; then
-  : "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required to create the site}"
+# The marker is written only after a bootstrap that finished. site_config.json
+# is not a safe substitute: `bench new-site` writes it before it touches the
+# database, so an interrupted first boot leaves a site directory pointing at an
+# empty schema, which later boots then try to migrate.
+SITE_READY="${SITES}/${SITE_NAME}/.railway-site-ready"
+if [ ! -f "${SITE_READY}" ]; then
   : "${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required to create the site}"
-  log "creating site ${SITE_NAME} (this takes several minutes on first boot)"
-  bench new-site "${SITE_NAME}" \
-    --db-name "${SITE_DB_NAME}" \
-    --db-password "${SITE_DB_PASSWORD}" \
-    --db-root-username "${DB_ROOT_USER}" \
-    --db-root-password "${DB_ROOT_PASSWORD}" \
-    --admin-password "${ADMIN_PASSWORD}" \
-    --mariadb-user-host-login-scope='%' \
-    --install-app erpnext \
-    --set-default \
-    --verbose
-  # new-site derives the scheduler state from a site that did not exist yet and
-  # lands on "disabled"; without this, nothing scheduled ever runs.
-  bench --site "${SITE_NAME}" enable-scheduler
-  printf '%s' "${APP_VERSIONS}" > "${VERSION_MARKER}"
-  log "site ${SITE_NAME} created"
+
+  TABLE_COUNT="$(MYSQL_PWD="${DB_ROOT_PASSWORD}" mariadb -h "${DB_HOST}" -P "${DB_PORT}" \
+    -u "${DB_ROOT_USER}" -N -B -e \
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${SITE_DB_NAME}'" \
+    2>/dev/null || echo 0)"
+
+  if [ "${TABLE_COUNT:-0}" -gt 0 ]; then
+    # The database already holds a site — the volume is new, not the install.
+    # Everything site_config.json needs is derived from FRAPPE_SECRET, so
+    # reattach rather than dropping a live schema.
+    log "database ${SITE_DB_NAME} holds ${TABLE_COUNT} tables; reattaching to it"
+    mkdir -p "${SITES}/${SITE_NAME}/public/files" \
+      "${SITES}/${SITE_NAME}/private/files" \
+      "${SITES}/${SITE_NAME}/private/backups" \
+      "${SITES}/${SITE_NAME}/locks" \
+      "${SITES}/${SITE_NAME}/logs"
+    if [ ! -f "${SITES}/${SITE_NAME}/site_config.json" ]; then
+      SITE_CONFIG_PATH="${SITES}/${SITE_NAME}/site_config.json" \
+      SITE_DB_NAME="${SITE_DB_NAME}" SITE_DB_PASSWORD="${SITE_DB_PASSWORD}" \
+      python3 - <<'PY'
+import json, os
+json.dump(
+    {
+        "db_name": os.environ["SITE_DB_NAME"],
+        "db_password": os.environ["SITE_DB_PASSWORD"],
+        "db_type": "mariadb",
+        "db_user": os.environ["SITE_DB_NAME"],
+    },
+    open(os.environ["SITE_CONFIG_PATH"], "w"),
+    indent=1,
+    sort_keys=True,
+)
+PY
+    fi
+    # Force the migrate below: the reattached schema may predate this image.
+    rm -f "${VERSION_MARKER}"
+  else
+    : "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required to create the site}"
+    log "creating site ${SITE_NAME} (this takes several minutes on first boot)"
+    # --force covers the database and site directory a previous interrupted
+    # boot may have left behind. Reached only when the schema is empty.
+    rm -rf "${SITES:?}/${SITE_NAME:?}"
+    bench new-site "${SITE_NAME}" \
+      --force \
+      --db-name "${SITE_DB_NAME}" \
+      --db-password "${SITE_DB_PASSWORD}" \
+      --db-root-username "${DB_ROOT_USER}" \
+      --db-root-password "${DB_ROOT_PASSWORD}" \
+      --admin-password "${ADMIN_PASSWORD}" \
+      --mariadb-user-host-login-scope='%' \
+      --install-app erpnext \
+      --set-default \
+      --verbose
+    # new-site derives the scheduler state from a site that did not exist yet
+    # and lands on "disabled"; without this, nothing scheduled ever runs.
+    bench --site "${SITE_NAME}" enable-scheduler
+    printf '%s' "${APP_VERSIONS}" > "${VERSION_MARKER}"
+    log "site ${SITE_NAME} created"
+  fi
+  touch "${SITE_READY}"
 else
   log "site ${SITE_NAME} already exists"
 fi
